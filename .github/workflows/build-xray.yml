@@ -333,4 +333,3 @@ jobs:
           name: xray-ore
           path: build/libs/xray-ore-1.0.0.jar
           if-no-files-found: error
-          
