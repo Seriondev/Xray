@@ -1,0 +1,336 @@
+name: build-xray
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.14.3
+
+      - name: Generate mod project
+        run: |
+          set -e
+
+          # Ambil versi terbaru yang cocok dengan 1.21.10 langsung dari Fabric
+          FABRIC_API=$(curl -fsS https://maven.fabricmc.net/net/fabricmc/fabric-api/fabric-api/maven-metadata.xml | grep -o '<version>[^<]*+1\.21\.10</version>' | sed 's/<[^>]*>//g' | tail -n1)
+          YARN=$(curl -fsS https://meta.fabricmc.net/v2/versions/yarn/1.21.10 | jq -r '.[0].version')
+          LOADER=$(curl -fsS https://meta.fabricmc.net/v2/versions/loader | jq -r '[.[] | select(.stable)][0].version')
+          echo "Fabric API: $FABRIC_API"
+          echo "Yarn: $YARN"
+          echo "Loader: $LOADER"
+          if [ -z "$FABRIC_API" ] || [ -z "$YARN" ] || [ "$YARN" = "null" ] || [ -z "$LOADER" ]; then
+            echo "Gagal mengambil versi dari Fabric"
+            exit 1
+          fi
+
+          mkdir -p src/main/java/com/vizko/xrayore/mixin
+          mkdir -p src/main/resources/assets/xrayore/lang
+
+          cat > settings.gradle <<'EOF'
+          pluginManagement {
+              repositories {
+                  maven { url = 'https://maven.fabricmc.net/' }
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          EOF
+
+          cat > gradle.properties <<EOF
+          org.gradle.jvmargs=-Xmx2G
+          minecraft_version=1.21.10
+          yarn_mappings=$YARN
+          loader_version=$LOADER
+          fabric_version=$FABRIC_API
+          mod_version=1.0.0
+          maven_group=com.vizko
+          archives_base_name=xray-ore
+          EOF
+
+          cat > build.gradle <<'EOF'
+          plugins {
+              id 'fabric-loom' version '1.11-SNAPSHOT'
+          }
+
+          version = project.mod_version
+          group = project.maven_group
+
+          base {
+              archivesName = project.archives_base_name
+          }
+
+          dependencies {
+              minecraft "com.mojang:minecraft:${project.minecraft_version}"
+              mappings "net.fabricmc:yarn:${project.yarn_mappings}:v2"
+              modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
+              modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_version}"
+          }
+
+          processResources {
+              inputs.property "version", project.version
+              filesMatching("fabric.mod.json") {
+                  expand "version": inputs.properties.version
+              }
+          }
+
+          tasks.withType(JavaCompile).configureEach {
+              it.options.release = 21
+          }
+
+          java {
+              sourceCompatibility = JavaVersion.VERSION_21
+              targetCompatibility = JavaVersion.VERSION_21
+          }
+          EOF
+
+          cat > src/main/resources/fabric.mod.json <<'EOF'
+          {
+            "schemaVersion": 1,
+            "id": "xrayore",
+            "version": "${version}",
+            "name": "Xray Ore",
+            "description": "Xray client-side: ore kelihatan tembus batu, blok lain jadi kerangka outline.",
+            "authors": ["Unknown"],
+            "license": "MIT",
+            "environment": "client",
+            "entrypoints": {
+              "client": ["com.vizko.xrayore.XrayOreClient"]
+            },
+            "mixins": [
+              { "config": "xrayore.mixins.json", "environment": "client" }
+            ],
+            "depends": {
+              "fabricloader": ">=0.17.0",
+              "minecraft": "~1.21.10",
+              "java": ">=21",
+              "fabric-api": "*"
+            }
+          }
+          EOF
+
+          cat > src/main/resources/xrayore.mixins.json <<'EOF'
+          {
+            "required": true,
+            "minVersion": "0.8",
+            "package": "com.vizko.xrayore.mixin",
+            "compatibilityLevel": "JAVA_21",
+            "client": ["ChunkRendererRegionMixin"],
+            "injectors": { "defaultRequire": 1 }
+          }
+          EOF
+
+          cat > src/main/resources/assets/xrayore/lang/en_us.json <<'EOF'
+          {
+            "key.xrayore.toggle": "Toggle Xray"
+          }
+          EOF
+
+          cat > src/main/java/com/vizko/xrayore/mixin/ChunkRendererRegionMixin.java <<'EOF'
+          package com.vizko.xrayore.mixin;
+
+          import com.vizko.xrayore.XrayOreClient;
+          import net.minecraft.block.BlockState;
+          import net.minecraft.client.render.chunk.ChunkRendererRegion;
+          import net.minecraft.util.math.BlockPos;
+          import org.spongepowered.asm.mixin.Mixin;
+          import org.spongepowered.asm.mixin.injection.At;
+          import org.spongepowered.asm.mixin.injection.Inject;
+          import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
+
+          // Saat chunk dibangun ulang, blok non-ore "dianggap udara" kecuali rangka outline-nya.
+          @Mixin(ChunkRendererRegion.class)
+          public abstract class ChunkRendererRegionMixin {
+              @Inject(method = "getBlockState", at = @At("RETURN"), cancellable = true)
+              private void xrayore$filter(BlockPos pos, CallbackInfoReturnable<BlockState> cir) {
+                  if (XrayOreClient.enabled) {
+                      cir.setReturnValue(XrayOreClient.filter(cir.getReturnValue(), pos));
+                  }
+              }
+          }
+          EOF
+
+          cat > src/main/java/com/vizko/xrayore/XrayOreClient.java <<'EOF'
+          package com.vizko.xrayore;
+
+          import net.fabricmc.api.ClientModInitializer;
+          import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
+          import net.fabricmc.fabric.api.client.keybinding.v1.KeyBindingHelper;
+          import net.fabricmc.fabric.api.client.networking.v1.ClientPlayConnectionEvents;
+          import net.minecraft.block.Block;
+          import net.minecraft.block.BlockState;
+          import net.minecraft.block.Blocks;
+          import net.minecraft.client.MinecraftClient;
+          import net.minecraft.client.network.ClientPlayerEntity;
+          import net.minecraft.client.option.KeyBinding;
+          import net.minecraft.client.util.InputUtil;
+          import net.minecraft.entity.effect.StatusEffectInstance;
+          import net.minecraft.entity.effect.StatusEffects;
+          import net.minecraft.registry.Registries;
+          import net.minecraft.registry.tag.FluidTags;
+          import net.minecraft.text.Text;
+          import net.minecraft.util.Formatting;
+          import net.minecraft.util.math.BlockPos;
+          import org.lwjgl.glfw.GLFW;
+
+          import java.util.Map;
+          import java.util.concurrent.ConcurrentHashMap;
+
+          public class XrayOreClient implements ClientModInitializer {
+              // Selalu mati saat game / world baru dibuka
+              public static volatile boolean enabled = false;
+
+              // Area xray berpusat di posisi pemain saat xray dinyalakan / di-refresh
+              public static volatile int anchorX, anchorY, anchorZ;
+              public static final int RADIUS_H = 48;
+              public static final int RADIUS_V = 48;
+
+              // Rangka outline: blok non-ore dipertahankan jika minimal 2 dari 3 koordinatnya kelipatan 8
+              private static final int GRID_MASK = 7;
+
+              private static final Map<Block, Boolean> ORE_CACHE = new ConcurrentHashMap<>();
+              private static KeyBinding toggleKey;
+              private static boolean addedNightVision = false;
+              private static int ticksSinceRebuild = 0;
+
+              // Area xray ikut pemain secara otomatis kalau sudah bergeser sejauh ini
+              private static final int FOLLOW_DISTANCE = 32;
+              // Jeda minimal antar rebuild (tick, 20 tick = 1 detik) supaya tidak lag berulang
+              private static final int FOLLOW_COOLDOWN = 100;
+
+              public static boolean isOre(Block block) {
+                  return ORE_CACHE.computeIfAbsent(block, b -> {
+                      String path = Registries.BLOCK.getId(b).getPath();
+                      return path.endsWith("_ore") || path.equals("ancient_debris");
+                  });
+              }
+
+              /** Dipanggil saat chunk dibangun: tentukan blok mana yang tetap tampil. */
+              public static BlockState filter(BlockState state, BlockPos pos) {
+                  if (state.isAir()) return state;
+
+                  int x = pos.getX();
+                  int y = pos.getY();
+                  int z = pos.getZ();
+                  if (Math.abs(x - anchorX) > RADIUS_H
+                          || Math.abs(z - anchorZ) > RADIUS_H
+                          || Math.abs(y - anchorY) > RADIUS_V) {
+                      return state;
+                  }
+
+                  if (isOre(state.getBlock())) return state;
+                  if (state.getFluidState().isIn(FluidTags.LAVA)) return state;
+
+                  int zeros = ((x & GRID_MASK) == 0 ? 1 : 0)
+                          + ((y & GRID_MASK) == 0 ? 1 : 0)
+                          + ((z & GRID_MASK) == 0 ? 1 : 0);
+                  if (zeros >= 2) return state;
+
+                  return Blocks.AIR.getDefaultState();
+              }
+
+              @Override
+              public void onInitializeClient() {
+                  // Default tombol "=" (tanpa shift). Bisa diganti di Options > Controls.
+                  toggleKey = KeyBindingHelper.registerKeyBinding(new KeyBinding(
+                          "key.xrayore.toggle", InputUtil.Type.KEYSYM, GLFW.GLFW_KEY_EQUAL, KeyBinding.Category.MISC));
+
+                  // Masuk world baru: xray selalu mati
+                  ClientPlayConnectionEvents.JOIN.register((handler, sender, client) -> {
+                      enabled = false;
+                      addedNightVision = false;
+                  });
+
+                  ClientTickEvents.END_CLIENT_TICK.register(client -> {
+                      while (toggleKey.wasPressed()) {
+                          toggle(client);
+                      }
+                      updateNightVision(client);
+                      followPlayer(client);
+                  });
+              }
+
+              private static void toggle(MinecraftClient client) {
+                  if (client.player == null) return;
+                  enabled = !enabled;
+                  // Satu kali rebuild chunk saja (tidak berulang-ulang)
+                  rebuild(client);
+                  message(client, enabled
+                          ? Text.literal("Xray: ON").formatted(Formatting.GREEN)
+                          : Text.literal("Xray: OFF").formatted(Formatting.RED));
+              }
+
+              private static void rebuild(MinecraftClient client) {
+                  if (client.player == null) return;
+                  setAnchor(client.player);
+                  ticksSinceRebuild = 0;
+                  if (client.worldRenderer != null) {
+                      client.worldRenderer.reload();
+                  }
+              }
+
+              private static void setAnchor(ClientPlayerEntity player) {
+                  BlockPos p = player.getBlockPos();
+                  anchorX = p.getX();
+                  anchorY = p.getY();
+                  anchorZ = p.getZ();
+              }
+
+              private static void message(MinecraftClient client, Text text) {
+                  if (client.player != null) {
+                      client.player.sendMessage(text, true);
+                  }
+              }
+
+              // Pindah tempat? Area xray digeser otomatis, tanpa tombol apa pun
+              private static void followPlayer(MinecraftClient client) {
+                  if (ticksSinceRebuild < Integer.MAX_VALUE) ticksSinceRebuild++;
+                  if (!enabled || client.player == null || ticksSinceRebuild < FOLLOW_COOLDOWN) return;
+                  double dx = Math.abs(client.player.getX() - anchorX);
+                  double dy = Math.abs(client.player.getY() - anchorY);
+                  double dz = Math.abs(client.player.getZ() - anchorZ);
+                  if (Math.max(Math.max(dx, dz), dy) > FOLLOW_DISTANCE) {
+                      rebuild(client);
+                  }
+              }
+
+              // Biar ore di dalam batu tidak gelap
+              private static void updateNightVision(MinecraftClient client) {
+                  if (client.player == null) return;
+                  if (enabled) {
+                      if (!client.player.hasStatusEffect(StatusEffects.NIGHT_VISION)) {
+                          client.player.addStatusEffect(new StatusEffectInstance(
+                                  StatusEffects.NIGHT_VISION, StatusEffectInstance.INFINITE, 0, false, false, false));
+                          addedNightVision = true;
+                      }
+                  } else if (addedNightVision) {
+                      client.player.removeStatusEffect(StatusEffects.NIGHT_VISION);
+                      addedNightVision = false;
+                  }
+              }
+          }
+          EOF
+
+          find src -type f
+
+      - name: Build
+        run: gradle build --no-daemon
+
+      - name: Upload jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: xray-ore
+          path: build/libs/xray-ore-1.0.0.jar
+          if-no-files-found: error
+          
